@@ -24,9 +24,11 @@ WRONG_KEY_RESPONSE = {
 }
 # -------------------------------
 
-LIKES_PER_TOKEN_PER_DAY = 30          # ← প্রতি guest id দিনে ৩০ বার লাইক
-LIKES_PER_USER_REQUEST = 700          # প্রতি user request এ target (capacity সাপেক্ষে সীমিত)
-TOKEN_FILE = "token_bd.json"          # ১১০টি guest id
+LIKES_PER_TOKEN_PER_DAY = 30           # প্রতি guest id দিনে ৩০ বার লাইক
+TOKEN_FILE = "token_bd.json"           # লাইক দেওয়ার token
+
+VISIT_TOKEN_FILE = "token_visit.json"  # প্রোফাইল ভিউ/ইনফরমেশনের token
+VISIT_PER_TOKEN_PER_DAY = 100          # visit token প্রতি দিনে কতবার ব্যবহার হবে
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -42,7 +44,8 @@ def _today_utc():
 
 
 def load_state():
-    default = {"date": _today_utc(), "usage": {}}
+    """state-এ দুইটি bucket: likes (usage) এবং visits (visit_usage)"""
+    default = {"date": _today_utc(), "usage": {}, "visit_usage": {}}
     if not os.path.exists(STATE_FILE):
         return default
     try:
@@ -52,6 +55,7 @@ def load_state():
             print("New UTC day -> resetting limits")
             return default
         state.setdefault("usage", {})
+        state.setdefault("visit_usage", {})
         return state
     except Exception as e:
         print(f"State load error: {e}")
@@ -92,7 +96,14 @@ def load_token_file(file_name):
 
 def load_all_tokens():
     tokens = load_token_file(TOKEN_FILE)
-    print(f"Loaded {len(tokens)} tokens from {TOKEN_FILE}")
+    print(f"Loaded {len(tokens)} like-tokens from {TOKEN_FILE}")
+    return tokens
+
+
+def load_visit_tokens():
+    """token_visit.json থেকে প্রোফাইল ভিউয়ের জন্য token লোড করে"""
+    tokens = load_token_file(VISIT_TOKEN_FILE)
+    print(f"Loaded {len(tokens)} visit-tokens from {VISIT_TOKEN_FILE}")
     return tokens
 
 
@@ -198,13 +209,14 @@ def get_like_api_url(server_name):
         return "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
 
-def select_tokens_for_likes(all_tokens, required_count, state):
-    """প্রয়োজনীয় সংখ্যক টোকেন বাছাই করে যেগুলোর দৈনিক লিমিট (৩০/দিন) বাকি আছে।"""
+def select_tokens_for_likes(all_tokens, state):
+    """
+    token_bd.json এর সব guest ID ব্যবহার করে।
+    প্রতিটি টোকেন দিনে LIKES_PER_TOKEN_PER_DAY (30) বার লাইক দিতে পারবে।
+    """
     usage = state["usage"]
     selected = []
     for token_dict in all_tokens:
-        if len(selected) >= required_count:
-            break
         tok = token_dict["token"]
         used = usage.get(tok, 0)
         if used < LIKES_PER_TOKEN_PER_DAY:
@@ -212,13 +224,25 @@ def select_tokens_for_likes(all_tokens, required_count, state):
     return selected
 
 
-def get_next_profile_token(all_tokens, state):
-    usage = state["usage"]
-    for token_dict in all_tokens:
+def get_next_visit_token(visit_tokens, state):
+    """
+    visit token pool থেকে একটি token বেছে নেয়।
+    যেটা দিনে VISIT_PER_TOKEN_PER_DAY বারের কম ব্যবহার হয়েছে।
+    সব শেষ হলে None রিটার্ন করে।
+    """
+    usage = state.get("visit_usage", {})
+    for token_dict in visit_tokens:
         tok = token_dict["token"]
-        if usage.get(tok, 0) < LIKES_PER_TOKEN_PER_DAY:
+        if usage.get(tok, 0) < VISIT_PER_TOKEN_PER_DAY:
             return token_dict
-    return all_tokens[0] if all_tokens else None
+    return None
+
+
+def bump_visit_usage(state, token_dict):
+    """একটি visit token-এর ব্যবহার ১ বাড়ায়"""
+    usage = state.setdefault("visit_usage", {})
+    tok = token_dict["token"]
+    usage[tok] = usage.get(tok, 0) + 1
 
 
 app = Flask(__name__)
@@ -226,6 +250,21 @@ app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def home():
+    all_tokens = load_all_tokens()
+    visit_tokens = load_visit_tokens()
+    with state_lock:
+        state = load_state()
+        usage = state["usage"]
+        vusage = state.get("visit_usage", {})
+
+    total_used = sum(usage.get(t["token"], 0) for t in all_tokens)
+    total_cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
+    remaining = max(0, total_cap - total_used)
+
+    vused = sum(vusage.get(t["token"], 0) for t in visit_tokens)
+    vcap = len(visit_tokens) * VISIT_PER_TOKEN_PER_DAY
+    vremaining = max(0, vcap - vused)
+
     return jsonify({
         "api": "Free Fire Like API",
         "status": "online",
@@ -234,9 +273,27 @@ def home():
             "/token_info": "?key=YOUR_KEY"
         },
         "config": {
-            "tokens": "110 guest IDs",
+            "like_token_file": TOKEN_FILE,
+            "total_like_tokens_loaded": len(all_tokens),
             "likes_per_token_per_day": LIKES_PER_TOKEN_PER_DAY,
-            "daily_capacity": 110 * LIKES_PER_TOKEN_PER_DAY
+            "like_daily_capacity": total_cap,
+            "visit_token_file": VISIT_TOKEN_FILE,
+            "total_visit_tokens_loaded": len(visit_tokens),
+            "visits_per_token_per_day": VISIT_PER_TOKEN_PER_DAY,
+            "visit_daily_capacity": vcap
+        },
+        "today_usage": {
+            "date_utc": state.get("date"),
+            "likes": {
+                "used": total_used,
+                "capacity": total_cap,
+                "remaining": remaining
+            },
+            "visits": {
+                "used": vused,
+                "capacity": vcap,
+                "remaining": vremaining
+            }
         },
         "credits": "@HAFSAN_KUN"
     })
@@ -254,6 +311,7 @@ def handle_requests():
     if not uid_param:
         return jsonify({"error": "UID is required", "credits": "@HAFSAN_KUN"}), 400
 
+    # ---- লাইক দেওয়ার token লোড ----
     all_tokens = load_all_tokens()
     if not all_tokens:
         return jsonify({
@@ -261,24 +319,40 @@ def handle_requests():
             "credits": "@HAFSAN_KUN"
         }), 500
 
+    # ---- প্রোফাইল ভিউয়ের token লোড (token_visit.json) ----
+    visit_tokens = load_visit_tokens()
+    if not visit_tokens:
+        return jsonify({
+            "error": f"No tokens loaded from {VISIT_TOKEN_FILE}",
+            "credits": "@HAFSAN_KUN"
+        }), 500
+
     with state_lock:
         state = load_state()
+        profile_token = get_next_visit_token(visit_tokens, state)
 
-    profile_token = get_next_profile_token(all_tokens, state)
     if not profile_token:
-        return jsonify({"error": "No token for profile check."}), 500
+        return jsonify({
+            "error": f"All visit tokens reached daily limit ({VISIT_PER_TOKEN_PER_DAY}/day). Try again tomorrow (UTC).",
+            "credits": "@HAFSAN_KUN"
+        }), 500
 
+    # ---- BEFORE চেক (visit token দিয়ে) ----
     enc_uid = enc_profile_check_payload(uid_param)
     before_info = make_profile_check_request(enc_uid, server_name_param, profile_token)
     before_likes = int(before_info.AccountInfo.Likes) if (before_info and hasattr(before_info, 'AccountInfo')) else 0
     print(f"UID {uid_param}: before = {before_likes}")
 
-    # প্রতিটি টোকেন এখন দিনে ৩০ বার লাইক দিতে পারে
-    # তাই ২২০+ এর জন্য এখন ২২০টি টোকেন লাগবে, কিন্তু আমাদের আছে ১১০টি
-    # কাজেই capacity অনুযায়ী টোকেন বাছাই করবো
+    # before চেকের জন্য visit usage বাড়াও
     with state_lock:
         state = load_state()
-        selected = select_tokens_for_likes(all_tokens, LIKES_PER_USER_REQUEST, state)
+        bump_visit_usage(state, profile_token)
+        save_state(state)
+
+    # ---- লাইক পাঠানোর জন্য token বাছাই (token_bd.json) ----
+    with state_lock:
+        state = load_state()
+        selected = select_tokens_for_likes(all_tokens, state)
 
     if not selected:
         return jsonify({
@@ -288,7 +362,7 @@ def handle_requests():
             "PlayerNickname": "N/A",
             "UID": int(uid_param),
             "status": 2,
-            "message": "All tokens reached daily limit (30/token/day). Try again tomorrow (UTC).",
+            "message": f"All like-tokens reached daily limit ({LIKES_PER_TOKEN_PER_DAY}/token/day). Try again tomorrow (UTC).",
             "credits": "@HAFSAN_KUN"
         })
 
@@ -321,7 +395,14 @@ def handle_requests():
                 success_count += 1
         save_state(state)
 
-    after_info = make_profile_check_request(enc_uid, server_name_param, profile_token)
+    # ---- AFTER চেক (আরেকটি visit token দিয়ে, সম্ভব হলে) ----
+    with state_lock:
+        state = load_state()
+        after_token = get_next_visit_token(visit_tokens, state)
+    if not after_token:
+        after_token = profile_token  # ফলব্যাক
+
+    after_info = make_profile_check_request(enc_uid, server_name_param, after_token)
     after_likes = int(after_info.AccountInfo.Likes) if (after_info and hasattr(after_info, 'AccountInfo')) else before_likes
     nickname = "N/A"
     actual_uid = int(uid_param)
@@ -330,15 +411,27 @@ def handle_requests():
         if after_info.AccountInfo.PlayerNickname:
             nickname = str(after_info.AccountInfo.PlayerNickname)
 
+    # after চেকের জন্য visit usage বাড়াও
+    with state_lock:
+        state = load_state()
+        bump_visit_usage(state, after_token)
+        save_state(state)
+
     increment = after_likes - before_likes
     status = 1 if increment > 0 else 2
 
     with state_lock:
         state = load_state()
         usage = state["usage"]
+        vusage = state.get("visit_usage", {})
+
     total_used = sum(usage.values())
     total_cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
     remaining = max(0, total_cap - total_used)
+
+    vused = sum(vusage.get(t["token"], 0) for t in visit_tokens)
+    vcap = len(visit_tokens) * VISIT_PER_TOKEN_PER_DAY
+    vremaining = max(0, vcap - vused)
 
     return jsonify({
         "LikesGivenByAPI": increment,
@@ -350,9 +443,16 @@ def handle_requests():
         "TokensUsedThisRequest": len(selected),
         "SuccessfulSends": success_count,
         "DailyUsage": {
-            "used": total_used,
-            "capacity": total_cap,
-            "remaining": remaining
+            "likes": {
+                "used": total_used,
+                "capacity": total_cap,
+                "remaining": remaining
+            },
+            "visits": {
+                "used": vused,
+                "capacity": vcap,
+                "remaining": vremaining
+            }
         },
         "credits": "@HAFSAN_KUN"
     })
@@ -365,38 +465,81 @@ def token_info():
         return jsonify(WRONG_KEY_RESPONSE), 401
 
     all_tokens = load_all_tokens()
+    visit_tokens = load_visit_tokens()
+
     with state_lock:
         state = load_state()
         usage = state["usage"]
+        vusage = state.get("visit_usage", {})
 
+    # ---- Like token স্ট্যাটাস ----
     used = sum(usage.get(t["token"], 0) for t in all_tokens)
     cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
     remaining = max(0, cap - used)
 
     per_token_status = []
-    for t in all_tokens[:10]:
+    for t in all_tokens:
         tok = t["token"]
         u = usage.get(tok, 0)
         per_token_status.append({
             "token_preview": tok[:8] + "..." if len(tok) > 8 else tok,
             "used": u,
-            "remaining": max(0, LIKES_PER_TOKEN_PER_DAY - u)
+            "remaining": max(0, LIKES_PER_TOKEN_PER_DAY - u),
+            "exhausted": u >= LIKES_PER_TOKEN_PER_DAY
         })
+
+    active_tokens = sum(1 for t in all_tokens if usage.get(t["token"], 0) < LIKES_PER_TOKEN_PER_DAY)
+
+    # ---- Visit token স্ট্যাটাস ----
+    vused = sum(vusage.get(t["token"], 0) for t in visit_tokens)
+    vcap = len(visit_tokens) * VISIT_PER_TOKEN_PER_DAY
+    vremaining = max(0, vcap - vused)
+
+    v_per_token_status = []
+    for t in visit_tokens:
+        tok = t["token"]
+        u = vusage.get(tok, 0)
+        v_per_token_status.append({
+            "token_preview": tok[:8] + "..." if len(tok) > 8 else tok,
+            "used": u,
+            "remaining": max(0, VISIT_PER_TOKEN_PER_DAY - u),
+            "exhausted": u >= VISIT_PER_TOKEN_PER_DAY
+        })
+
+    v_active_tokens = sum(1 for t in visit_tokens if vusage.get(t["token"], 0) < VISIT_PER_TOKEN_PER_DAY)
 
     return jsonify({
         "date_utc": state.get("date"),
-        "file": TOKEN_FILE,
-        "total": {
-            "tokens": len(all_tokens),
-            "used_today": used,
-            "capacity_today": cap,
-            "remaining_today": remaining
+        "like_tokens": {
+            "file": TOKEN_FILE,
+            "total": {
+                "tokens": len(all_tokens),
+                "active_tokens": active_tokens,
+                "exhausted_tokens": len(all_tokens) - active_tokens,
+                "used_today": used,
+                "capacity_today": cap,
+                "remaining_today": remaining
+            },
+            "config": {
+                "LIKES_PER_TOKEN_PER_DAY": LIKES_PER_TOKEN_PER_DAY
+            },
+            "tokens": per_token_status
         },
-        "config": {
-            "LIKES_PER_TOKEN_PER_DAY": LIKES_PER_TOKEN_PER_DAY,
-            "LIKES_PER_USER_REQUEST": LIKES_PER_USER_REQUEST
+        "visit_tokens": {
+            "file": VISIT_TOKEN_FILE,
+            "total": {
+                "tokens": len(visit_tokens),
+                "active_tokens": v_active_tokens,
+                "exhausted_tokens": len(visit_tokens) - v_active_tokens,
+                "used_today": vused,
+                "capacity_today": vcap,
+                "remaining_today": vremaining
+            },
+            "config": {
+                "VISIT_PER_TOKEN_PER_DAY": VISIT_PER_TOKEN_PER_DAY
+            },
+            "tokens": v_per_token_status
         },
-        "sample_tokens": per_token_status,
         "credits": "@HAFSAN_KUN"
     })
 
